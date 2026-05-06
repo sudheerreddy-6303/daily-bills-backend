@@ -10,17 +10,23 @@ require('dotenv').config();
 const app = express();
 
 // ── Security ────────────────────────────────────────────────────
-app.use(helmet());
+// Disable helmet policies that block Render/cross-origin requests
+app.use(helmet({ crossOriginResourcePolicy: false, crossOriginOpenerPolicy: false }));
+
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'http://localhost:3000').split(',').map(o => o.trim());
 app.use(cors({
   origin: (origin, cb) => {
-    if (!origin || ALLOWED_ORIGINS.includes('*') || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+    // Allow no-origin requests (health checks, curl, Render internal)
+    if (!origin) return cb(null, true);
+    if (ALLOWED_ORIGINS.includes('*') || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
     cb(new Error(`CORS blocked: ${origin}`));
   },
   methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
   allowedHeaders: ['Content-Type','Authorization'],
   credentials: true,
 }));
+// Handle preflight for all routes
+app.options('*', cors());
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
@@ -621,6 +627,7 @@ app.delete('/api/bills/:id', requireAuth, writeLimiter, async (req, res) => {
 
 // ── Health check ────────────────────────────────────────────────
 app.get('/', (req, res) => res.json({ status: 'ok', service: 'DailyBills API' }));
+app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
 // ── Error handler ───────────────────────────────────────────────
 app.use((err, req, res, next) => {
@@ -633,10 +640,9 @@ process.on('unhandledRejection', err => console.error('Rejected:', err));
 
 const PORT = process.env.PORT || 5002;
 (async () => {
-  if (!process.env.DB_HOST) { console.error('DB_HOST not set'); process.exit(1); }
   try {
     await initDB();
-    app.listen(PORT, () => console.log(`✅ DailyBills API running on port ${PORT}`));
+    app.listen(PORT, '0.0.0.0', () => console.log(`✅ DailyBills API running on port ${PORT}`));
   } catch (err) {
     console.error('Startup failed:', err);
     process.exit(1);
