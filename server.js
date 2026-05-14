@@ -100,7 +100,7 @@ async function initDB() {
         sub_category  VARCHAR(100),
         vendor        VARCHAR(255),
         paid_by       VARCHAR(100),
-        payment_mode  ENUM('Cash','UPI','Bank Transfer','Cheque','Other') DEFAULT 'Cash',
+        payment_mode  VARCHAR(80) DEFAULT 'Cash',
         amount        DECIMAL(12,2) NOT NULL DEFAULT 0,
         gst_tax       VARCHAR(50),
         bill_attached ENUM('Yes','No') DEFAULT 'No',
@@ -161,6 +161,67 @@ async function initDB() {
         UNIQUE KEY uq_field_value (field_name, value)
       )
     `);
+
+    // ── Migrate payment_mode from ENUM to VARCHAR if needed ──────────
+    try {
+      await conn.execute("ALTER TABLE bills MODIFY COLUMN payment_mode VARCHAR(80) DEFAULT 'Cash'");
+    } catch(e) { /* already VARCHAR or doesn't exist yet */ }
+
+    // ── RESET & re-seed category + sub_category (removes old ones) ──
+    await conn.execute("DELETE FROM dropdown_options WHERE field_name IN ('category','sub_category')");
+
+    // ── Seed dropdown options ─────────────────────────────────────
+    const SEED_OPTS = [
+      // ── Categories (11 only) ──────────────────────────────────
+      ...['Plywood','Laminates','Transport','Salary','IT Bills','Petty Cash',
+          'Current Bills','Rent','Stationary','Food','Maintanance']
+        .map(v => ['category', v]),
+
+      // ── Sub-categories (mapped to their parent category) ──────
+      // Plywood
+      ...['16mm Plywood','9mm Plywood','12mm Plywood','18mm Plywood',
+          '19mm Plywood 8/4','19mm Plywood 7/4',
+          '16mm HDHMR','18mm HDHMR','12mm HDHMR','9mm HDHMR']
+        .map(v => ['sub_category', v]),
+      // Laminates
+      ...['0.8mm Laminate Linear','1mm Colour Laminates','1.25mm Acrylic Sheets']
+        .map(v => ['sub_category', v]),
+      // Transport
+      ...['Material','Man Power']
+        .map(v => ['sub_category', v]),
+      // IT Bills
+      ...['Internet Bills','Computers','Printers']
+        .map(v => ['sub_category', v]),
+      // Current Bills / Rent / Maintanance shared locations
+      ...['Medhal','Suchitra','Nanakram Guda','Kompally']
+        .map(v => ['sub_category', v]),
+      // Stationary
+      ...['Pens','Books','Batteries']
+        .map(v => ['sub_category', v]),
+      // Salary, Petty Cash, Food — no defaults (add-new only)
+
+      // ── Other dropdowns (INSERT IGNORE — preserve user additions) ─
+      ...['Medhal Office','Suchitra','Nanakram Guda','Kompally','Head Office']
+        .map(v => ['purpose_site', v]),
+      ...['Cash','UPI','Bank Transfer','Cheque','Credit Card','Other']
+        .map(v => ['payment_mode', v]),
+      ...['Ramya','Teja','Sundar','Bank Account','Petty Cash Box']
+        .map(v => ['paid_by', v]),
+      ...['Ramya','Sundar','Seshagiri Raju','Manager']
+        .map(v => ['approved_by', v]),
+      ...['Yes','No','5%','12%','18%','28%']
+        .map(v => ['gst_tax', v]),
+    ];
+
+    for (const [field_name, value] of SEED_OPTS) {
+      try {
+        // Use INSERT IGNORE for non-category fields to preserve user-added items
+        await conn.execute(
+          'INSERT IGNORE INTO dropdown_options (field_name, value) VALUES (?,?)',
+          [field_name, value]
+        );
+      } catch(e) { /* ignore */ }
+    }
 
     console.log('DB initialized successfully.');
   } finally { conn.release(); }
