@@ -68,6 +68,7 @@ const pool = mysql.createPool({
   waitForConnections: true,
   connectionLimit: 10,
   ssl: { rejectUnauthorized: false },
+  dateStrings: true,
 });
 
 // ── DB Init ─────────────────────────────────────────────────────
@@ -222,6 +223,22 @@ async function initDB() {
         );
       } catch(e) { /* ignore */ }
     }
+
+    // ── Collections table (payments received per project) ──────────
+    await conn.execute(`
+      CREATE TABLE IF NOT EXISTS collections (
+        id              INT AUTO_INCREMENT PRIMARY KEY,
+        project_name    VARCHAR(255) NOT NULL,
+        total_booked    DECIMAL(14,2) NOT NULL DEFAULT 0,
+        received_amount DECIMAL(14,2) NOT NULL DEFAULT 0,
+        payment_method  VARCHAR(80) DEFAULT 'Cash',
+        received_by     VARCHAR(100),
+        notes           TEXT,
+        created_by      INT,
+        created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL
+      )
+    `);
 
     console.log('DB initialized successfully.');
   } finally { conn.release(); }
@@ -456,7 +473,7 @@ app.get('/api/bills/dashboard', requireAuth, async (req, res) => {
     if (vendor)       { baseWhere += ' AND vendor LIKE ?';   baseParams.push(`%${vendor}%`); }
     if (approved_by)  { baseWhere += ' AND approved_by=?';   baseParams.push(approved_by); }
 
-    const [[totals]] = await pool.execute(`
+    const [[totals]] = await pool.query(`
       SELECT
         COUNT(*)                                                                   as total_count,
         COALESCE(SUM(amount), 0)                                                   as total_amount,
@@ -467,25 +484,25 @@ app.get('/api/bills/dashboard', requireAuth, async (req, res) => {
       FROM bills ${baseWhere}
     `, baseParams);
 
-    const [byCategory] = await pool.execute(`
+    const [byCategory] = await pool.query(`
       SELECT category, COALESCE(SUM(amount),0) as total, COUNT(*) as count
       FROM bills ${baseWhere}
       GROUP BY category ORDER BY total DESC
     `, baseParams);
 
-    const [bySite] = await pool.execute(`
+    const [bySite] = await pool.query(`
       SELECT purpose_site, COALESCE(SUM(amount),0) as total, COUNT(*) as count
       FROM bills ${baseWhere}
       GROUP BY purpose_site ORDER BY total DESC LIMIT 10
     `, baseParams);
 
-    const [byPaidBy] = await pool.execute(`
+    const [byPaidBy] = await pool.query(`
       SELECT paid_by, COALESCE(SUM(amount),0) as total, COUNT(*) as count
       FROM bills ${baseWhere}
       GROUP BY paid_by ORDER BY total DESC LIMIT 8
     `, baseParams);
 
-    const [daily] = await pool.execute(`
+    const [daily] = await pool.query(`
       SELECT DATE_FORMAT(date,'%Y-%m-%d') as day_key,
              LPAD(DAY(MIN(date)),2,'0') as day,
              COALESCE(SUM(amount),0) as total
@@ -515,7 +532,7 @@ app.get('/api/bills/dashboard', requireAuth, async (req, res) => {
       }
     }
 
-    const [recent] = await pool.execute(`
+    const [recent] = await pool.query(`
       SELECT b.id, b.voucher_no, b.date, b.description, b.purpose_site,
              b.category, b.vendor, b.paid_by, b.payment_mode, b.amount,
              b.bill_attached, b.attachment_name, b.attachment_type,
@@ -550,7 +567,7 @@ app.get('/api/bills/dashboard', requireAuth, async (req, res) => {
     // Monthly trend (last 6 months)
     let trendWhere = req.user.role !== 'admin' ? 'WHERE created_by=?' : '';
     let trendParams = req.user.role !== 'admin' ? [req.user.id] : [];
-    const [monthly] = await pool.execute(`
+    const [monthly] = await pool.query(`
       SELECT YEAR(date) as yr,
              MONTH(date) as mo,
              DATE_FORMAT(MIN(date),'%b %Y') as month_label,
@@ -752,4 +769,117 @@ app.delete('/api/dropdowns', requireAdmin, async (req, res) => {
     await pool.execute('DELETE FROM dropdown_options WHERE field_name=? AND value=?', [field_name, value]);
     res.json({ success: true });
   } catch { res.status(500).json({ success: false, message: 'Server error.' }); }
+});
+
+// ════════════════════════════════════════════════════════════════
+//  COLLECTIONS ROUTES (Admin only) — payments received per project
+// ════════════════════════════════════════════════════════════════
+
+// GET /api/collections — list all collections (newest first)
+app.get('/api/collections', requireAdmin, async (req, res) => {
+  try {
+    const [rows] = await pool.execute(
+      `SELECT c.*, u.display AS created_by_name
+       FROM collections c
+       LEFT JOIN users u ON u.id = c.created_by
+       ORDER BY c.created_at DESC, c.id DESC`
+    );
+
+    // Compute amount used per project (summed from matching bills)
+    for (const row of rows) {
+      const proj = (row.project_name || '').trim();
+      if (!proj) { row.used = 0; row.remaining = Number(row.total_booked || 0); continue; }
+      const like = `%${proj}%`;
+      const [aggRows] = await pool.execute(
+        `SELECT COALESCE(SUM(amount),0) AS used
+         FROM bills
+         WHERE purpose_site LIKE ? OR description LIKE ?`,
+        [like, like]
+      );
+      row.used = Number((aggRows[0] && aggRows[0].used) || 0);
+      row.remaining = Number(row.total_booked || 0) - row.used;
+    }
+
+    res.json({ success: true, data: rows });
+  } catch (err) {
+    console.error('GET /collections:', err.message);
+    res.status(500).json({ success: false, message: 'Server error.' });
+  }
+});
+
+// POST /api/collections — add a new collection entry
+app.post('/api/collections', requireAdmin, writeLimiter, async (req, res) => {
+  const c = req.body;
+  if (!c.project_name || !c.project_name.trim())
+    return res.status(400).json({ success: false, message: 'Project name is required.' });
+  try {
+    const [r] = await pool.execute(
+      `INSERT INTO collections
+       (project_name, total_booked, received_amount, payment_method, received_by, notes, created_by)
+       VALUES (?,?,?,?,?,?,?)`,
+      [
+        c.project_name.trim(),
+        parseFloat(c.total_booked)    || 0,
+        parseFloat(c.received_amount) || 0,
+        c.payment_method || 'Cash',
+        c.received_by    || '',
+        c.notes          || '',
+        req.user.id,
+      ]
+    );
+    res.status(201).json({ success: true, id: r.insertId, message: 'Collection saved.' });
+  } catch (err) {
+    console.error('POST /collections:', err.message);
+    res.status(500).json({ success: false, message: 'Server error.' });
+  }
+});
+
+// DELETE /api/collections/:id — remove a collection entry
+app.delete('/api/collections/:id', requireAdmin, writeLimiter, async (req, res) => {
+  try {
+    const [existing] = await pool.execute('SELECT id FROM collections WHERE id=?', [req.params.id]);
+    if (!existing.length) return res.status(404).json({ success: false, message: 'Collection not found.' });
+    await pool.execute('DELETE FROM collections WHERE id=?', [req.params.id]);
+    res.json({ success: true, message: 'Collection deleted.' });
+  } catch { res.status(500).json({ success: false, message: 'Server error.' }); }
+});
+
+// GET /api/collections/:id/details — project spend pulled from bills
+//   "used" = sum of bills whose purpose_site / description matches the project name
+app.get('/api/collections/:id/details', requireAdmin, async (req, res) => {
+  try {
+    const [rows] = await pool.execute('SELECT * FROM collections WHERE id=?', [req.params.id]);
+    if (!rows.length) return res.status(404).json({ success: false, message: 'Collection not found.' });
+    const collection = rows[0];
+    const proj = (collection.project_name || '').trim();
+    const like = `%${proj}%`;
+
+    // Bills linked to this project by matching purpose/site or description
+    const [bills] = await pool.execute(
+      `SELECT id, voucher_no, date, description, category, purpose_site, vendor, amount
+       FROM bills
+       WHERE purpose_site LIKE ? OR description LIKE ?
+       ORDER BY date DESC, id DESC`,
+      [like, like]
+    );
+
+    const used = bills.reduce((s, b) => s + Number(b.amount || 0), 0);
+    const totalBooked = Number(collection.total_booked || 0);
+    const remaining   = totalBooked - used;
+
+    res.json({
+      success: true,
+      data: {
+        collection,
+        total_booked: totalBooked,
+        received_amount: Number(collection.received_amount || 0),
+        used,
+        remaining,
+        bills,
+      }
+    });
+  } catch (err) {
+    console.error('GET /collections/:id/details:', err.message);
+    res.status(500).json({ success: false, message: 'Server error.' });
+  }
 });
